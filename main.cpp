@@ -65,6 +65,9 @@ static GLuint colorVBO = 0;
 // GPU SSBOs for compute shader
 static GLuint posSSBO = 0;
 static GLuint velSSBO = 0;
+// Spatial hashing structures on GPU
+static GLuint headSSBO = 0; // int per cell, head of linked list (-1 == empty)
+static GLuint nextSSBO = 0; // int per boid, next index in linked list (-1 == end)
 // Compute program
 static GLuint computeProgram = 0;
 // Cached uniform locations for compute shader
@@ -73,6 +76,19 @@ static GLint uni_dt = -1;
 static GLint uni_maxSpeed = -1;
 static GLint uni_cohesionWeight = -1;
 static GLint uni_bounds = -1;
+// Additional uniforms for spatial hashing compute shader
+static GLint uni_mode = -1; // 0=clear heads,1=build lists,2=simulate
+static GLint uni_numCells = -1;
+static GLint uni_gridNx = -1;
+static GLint uni_gridNy = -1;
+static GLint uni_gridNz = -1;
+static GLint uni_cellSize = -1;
+static GLint uni_separationDist = -1;
+static GLint uni_alignmentDist = -1;
+static GLint uni_cohesionDist = -1;
+static GLint uni_sepWeight = -1;
+static GLint uni_aliWeight = -1;
+static GLint uni_cohWeight = -1;
 // CPU-side velocity buffer for initialization (vec4 per boid)
 std::vector<float> velBuffer;
 
@@ -81,7 +97,7 @@ float CELL_SIZE = 1.0f;
 int GRID_NX = 0, GRID_NY = 0, GRID_NZ = 0;
 std::vector<std::vector<int>> grid; // cell -> list of boid indices
 
-const int NUM_BOIDS = 16 * 1024*1024; // Configurable number of boids (16 million)
+const int NUM_BOIDS = 4 * 1024*1024; // Configurable number of boids (16 million)
 // Target density (boids per unit^3) used to size the cube automatically
 const float TARGET_DENSITY = 0.4f;
 // CUBE_SIZE and BOUNDS are runtime-adjusted in initializeFlock()
@@ -201,6 +217,20 @@ void initializeFlock() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, velSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, velBuffer.size() * sizeof(float), velBuffer.data(), GL_DYNAMIC_COPY);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    // Create head and next buffers for GPU spatial hashing (linked-list per cell)
+    std::vector<int> headInit(static_cast<size_t>(totalCells), -1);
+    std::vector<int> nextInit(static_cast<size_t>(NUM_BOIDS), -1);
+    glGenBuffers(1, &headSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, headSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, headInit.size() * sizeof(int), headInit.data(), GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, headSSBO);
+
+    glGenBuffers(1, &nextSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, nextSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, nextInit.size() * sizeof(int), nextInit.data(), GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, nextSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 }
 
@@ -438,23 +468,46 @@ void display() {
         // bind SSBOs (already bound in init, but ensure binding)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, posSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, headSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, nextSSBO);
         // set uniforms
-        GLint locNum = glGetUniformLocation(computeProgram, "numBoids");
-        if (locNum >= 0) glUniform1i(locNum, NUM_BOIDS);
-        GLint locDt = glGetUniformLocation(computeProgram, "dt");
-        // use a realistic per-frame dt (~16ms) to avoid large jumps
-        if (locDt >= 0) glUniform1f(locDt, 0.016f);
-        GLint locMax = glGetUniformLocation(computeProgram, "maxSpeed");
-        if (locMax >= 0) glUniform1f(locMax, MAX_SPEED);
-        GLint locCoh = glGetUniformLocation(computeProgram, "cohesionWeight");
-        if (locCoh >= 0) glUniform1f(locCoh, COHESION_WEIGHT);
-        GLint locBounds = glGetUniformLocation(computeProgram, "bounds");
-        if (locBounds >= 0) glUniform1f(locBounds, BOUNDS);
+        // Use cached uniform locations where available
+        if (uni_numBoids >= 0) glUniform1i(uni_numBoids, NUM_BOIDS);
+        if (uni_dt >= 0) glUniform1f(uni_dt, 0.016f);
+        if (uni_maxSpeed >= 0) glUniform1f(uni_maxSpeed, MAX_SPEED);
+        if (uni_cohWeight >= 0) glUniform1f(uni_cohWeight, COHESION_WEIGHT);
+        if (uni_bounds >= 0) glUniform1f(uni_bounds, BOUNDS);
+        int totalCells = GRID_NX * GRID_NY * GRID_NZ;
+        if (uni_numCells >= 0) glUniform1i(uni_numCells, totalCells);
+        if (uni_gridNx >= 0) glUniform1i(uni_gridNx, GRID_NX);
+        if (uni_gridNy >= 0) glUniform1i(uni_gridNy, GRID_NY);
+        if (uni_gridNz >= 0) glUniform1i(uni_gridNz, GRID_NZ);
+        if (uni_cellSize >= 0) glUniform1f(uni_cellSize, CELL_SIZE);
+        if (uni_separationDist >= 0) glUniform1f(uni_separationDist, SEPARATION_DISTANCE);
+        if (uni_alignmentDist >= 0) glUniform1f(uni_alignmentDist, ALIGNMENT_DISTANCE);
+        if (uni_cohesionDist >= 0) glUniform1f(uni_cohesionDist, COHESION_DISTANCE);
+        if (uni_sepWeight >= 0) glUniform1f(uni_sepWeight, SEPARATION_WEIGHT);
+        if (uni_aliWeight >= 0) glUniform1f(uni_aliWeight, ALIGNMENT_WEIGHT);
+        if (uni_cohWeight >= 0) glUniform1f(uni_cohWeight, COHESION_WEIGHT);
 
-        // dispatch compute
+        // Multi-pass dispatch: 0=clear heads, 1=build lists, 2=simulate
         const int localSize = 256;
-        int groups = (NUM_BOIDS + localSize - 1) / localSize;
-        glDispatchCompute(groups, 1, 1);
+        // clear heads
+        if (uni_mode >= 0) glUniform1i(uni_mode, 0);
+        int groupsCells = ( (GRID_NX * GRID_NY * GRID_NZ) + localSize - 1) / localSize;
+        glDispatchCompute(groupsCells, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        // build lists
+        if (uni_mode >= 0) glUniform1i(uni_mode, 1);
+        int groupsBoids = (NUM_BOIDS + localSize - 1) / localSize;
+        glDispatchCompute(groupsBoids, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        // simulate
+        if (uni_mode >= 0) glUniform1i(uni_mode, 2);
+        if (uni_dt >= 0) glUniform1f(uni_dt, 0.016f);
+        glDispatchCompute(groupsBoids, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
 
         // Copy updated positions from posSSBO to boidVBO and render from boidVBO
@@ -466,17 +519,13 @@ void display() {
         glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
 
         glBindBuffer(GL_ARRAY_BUFFER, boidVBO);
-        // Try to render directly from posSSBO (avoid costly GPU copy). Some drivers allow
-        // binding the same buffer object as ARRAY_BUFFER after using it as SSBO. If that
-        // fails visually, we can fall back to copying; but avoid copying by default.
-        glBindBuffer(GL_ARRAY_BUFFER, posSSBO);
         // bind color VBO
         if (colorVBO != 0) {
             glBindBuffer(GL_ARRAY_BUFFER, colorVBO);
             glEnableClientState(GL_COLOR_ARRAY);
             glColorPointer(4, GL_FLOAT, 0, reinterpret_cast<void*>(0));
         }
-        glBindBuffer(GL_ARRAY_BUFFER, posSSBO);
+        glBindBuffer(GL_ARRAY_BUFFER, boidVBO);
         glEnableClientState(GL_VERTEX_ARRAY);
         glVertexPointer(3, GL_FLOAT, 4 * sizeof(float), reinterpret_cast<void*>(0));
         glPointSize(4.0f);
@@ -569,43 +618,153 @@ static GLuint compileShader(GLenum type, const char* src) {
 // Create a simple compute shader that does a cheap update
 static void createComputeProgram() {
 #if 1
+#define STR(x) #x
     const char* computeSrc = R"GLSL(
 #version 430
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer Pos { vec4 pos[]; };
 layout(std430, binding = 1) buffer Vel { vec4 vel[]; };
+layout(std430, binding = 2) buffer Head { int head[]; };
+layout(std430, binding = 3) buffer Next { int next[]; };
+uniform int mode; // 0=clear heads, 1=build lists, 2=simulate
 uniform int numBoids;
+uniform int numCells;
+uniform int gridNx;
+uniform int gridNy;
+uniform int gridNz;
+uniform float cellSize;
 uniform float dt;
 uniform float maxSpeed;
-uniform float cohesionWeight;
 uniform float bounds;
+uniform float separationDist;
+uniform float alignmentDist;
+uniform float cohesionDist;
+uniform float sepWeight;
+uniform float aliWeight;
+uniform float cohWeight;
+
+// Helper: clamp integer into [0,ub)
+int clampi(int v, int ub) {
+    if (v < 0) return 0;
+    if (v >= ub) return ub - 1;
+    return v;
+}
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= uint(numBoids)) return;
-    vec3 p = pos[i].xyz;
-    vec3 v = vel[i].xyz;
-    // very cheap behavior: tiny center pull and per-boid jitter so they explore
-    vec3 toCenter = -p * 0.0005; // minimal pull toward center
-    v += toCenter * cohesionWeight;
-    // stronger jitter to avoid tight clustering
-    v += (vec3(fract(sin(float(i) * 12.9898) * 43758.5453) - 0.5,
-               fract(sin((float(i) + 1.0) * 78.233) * 43758.5453) - 0.5,
-               fract(sin((float(i) + 2.0) * 39.346) * 43758.5453) - 0.5) ) * 0.01;
-    v *= 0.9995; // mild damping
-    float sp = length(v);
-    if (sp > maxSpeed) v = normalize(v) * maxSpeed;
-    p += v * dt;
-    // reflect bounds
-    if (p.x > bounds) { p.x = bounds; v.x = -v.x; }
-    if (p.x < -bounds) { p.x = -bounds; v.x = -v.x; }
-    if (p.y > bounds) { p.y = bounds; v.y = -v.y; }
-    if (p.y < -bounds) { p.y = -bounds; v.y = -v.y; }
-    if (p.z > bounds) { p.z = bounds; v.z = -v.z; }
-    if (p.z < -bounds) { p.z = -bounds; v.z = -v.z; }
-    pos[i] = vec4(p, 1.0);
-    vel[i] = vec4(v, 0.0);
+    uint gid = gl_GlobalInvocationID.x;
+    if (mode == 0) {
+        // clear head array
+        if (gid < uint(numCells)) {
+            head[gid] = -1;
+        }
+        return;
+    }
+    if (mode == 1) {
+        // build linked lists: atomic push to head[cell]
+        if (gid >= uint(numBoids)) return;
+        vec3 p = pos[gid].xyz;
+        int ix = int(floor((p.x + bounds) / cellSize));
+        int iy = int(floor((p.y + bounds) / cellSize));
+        int iz = int(floor((p.z + bounds) / cellSize));
+        ix = clampi(ix, gridNx);
+        iy = clampi(iy, gridNy);
+        iz = clampi(iz, gridNz);
+        int cell = ix + iy * gridNx + iz * gridNx * gridNy;
+        int prev = atomicExchange(head[cell], int(gid));
+        next[gid] = prev;
+        return;
+    }
+    if (mode == 2) {
+        if (gid >= uint(numBoids)) return;
+        vec3 p = pos[gid].xyz;
+        vec3 v = vel[gid].xyz;
+        int ix = int(floor((p.x + bounds) / cellSize));
+        int iy = int(floor((p.y + bounds) / cellSize));
+        int iz = int(floor((p.z + bounds) / cellSize));
+        ix = clampi(ix, gridNx);
+        iy = clampi(iy, gridNy);
+        iz = clampi(iz, gridNz);
+
+        float sepDist2 = separationDist * separationDist;
+        float aliDist2 = alignmentDist * alignmentDist;
+        float cohDist2 = cohesionDist * cohesionDist;
+
+        vec3 separation = vec3(0.0);
+        vec3 alignment = vec3(0.0);
+        vec3 cohesion = vec3(0.0);
+        int sepCount = 0;
+        int aliCount = 0;
+        int cohCount = 0;
+
+        // iterate neighbor cells (3x3x3)
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int nx = clampi(ix + dx, gridNx);
+                    int ny = clampi(iy + dy, gridNy);
+                    int nz = clampi(iz + dz, gridNz);
+                    int cell = nx + ny * gridNx + nz * gridNx * gridNy;
+                    int j = head[cell];
+                    while (j != -1) {
+                        if (j != int(gid)) {
+                            vec3 op = pos[j].xyz;
+                            vec3 ov = vel[j].xyz;
+                            vec3 diff = p - op;
+                            float dist2 = dot(diff, diff);
+                            if (dist2 < sepDist2) {
+                                separation += normalize(diff);
+                                sepCount++;
+                            }
+                            if (dist2 < aliDist2) {
+                                alignment += ov;
+                                aliCount++;
+                            }
+                            if (dist2 < cohDist2) {
+                                cohesion += op;
+                                cohCount++;
+                            }
+                        }
+                        j = next[j];
+                    }
+                }
+            }
+        }
+
+        vec3 steer = vec3(0.0);
+        if (sepCount > 0) {
+            separation /= float(max(1, sepCount));
+            steer += (normalize(separation) * maxSpeed - v) * sepWeight;
+        }
+        if (aliCount > 0) {
+            alignment /= float(max(1, aliCount));
+            steer += (normalize(alignment) * maxSpeed - v) * aliWeight;
+        }
+        if (cohCount > 0) {
+            cohesion /= float(max(1, cohCount));
+            vec3 toCenter = cohesion - p;
+            steer += (normalize(toCenter) * maxSpeed - v) * cohWeight;
+        }
+
+        v += steer;
+        v *= 0.999; // damping
+        float sp = length(v);
+        if (sp > maxSpeed) v = normalize(v) * maxSpeed;
+        p += v * dt;
+        // reflect
+        if (p.x > bounds) { p.x = bounds; v.x = -v.x; }
+        if (p.x < -bounds) { p.x = -bounds; v.x = -v.x; }
+        if (p.y > bounds) { p.y = bounds; v.y = -v.y; }
+        if (p.y < -bounds) { p.y = -bounds; v.y = -v.y; }
+        if (p.z > bounds) { p.z = bounds; v.z = -v.z; }
+        if (p.z < -bounds) { p.z = -bounds; v.z = -v.z; }
+
+        pos[gid] = vec4(p, 1.0);
+        vel[gid] = vec4(v, 0.0);
+        return;
+    }
 }
 )GLSL";
+#undef STR
 #endif
 
     GLuint cs = compileShader(GL_COMPUTE_SHADER, computeSrc);
@@ -627,10 +786,21 @@ void main() {
     computeProgram = prog;
 
     // Cache uniform locations to avoid per-frame lookups
+    uni_mode = glGetUniformLocation(computeProgram, "mode");
     uni_numBoids = glGetUniformLocation(computeProgram, "numBoids");
+    uni_numCells = glGetUniformLocation(computeProgram, "numCells");
+    uni_gridNx = glGetUniformLocation(computeProgram, "gridNx");
+    uni_gridNy = glGetUniformLocation(computeProgram, "gridNy");
+    uni_gridNz = glGetUniformLocation(computeProgram, "gridNz");
+    uni_cellSize = glGetUniformLocation(computeProgram, "cellSize");
     uni_dt = glGetUniformLocation(computeProgram, "dt");
     uni_maxSpeed = glGetUniformLocation(computeProgram, "maxSpeed");
-    uni_cohesionWeight = glGetUniformLocation(computeProgram, "cohesionWeight");
+    uni_separationDist = glGetUniformLocation(computeProgram, "separationDist");
+    uni_alignmentDist = glGetUniformLocation(computeProgram, "alignmentDist");
+    uni_cohesionDist = glGetUniformLocation(computeProgram, "cohesionDist");
+    uni_sepWeight = glGetUniformLocation(computeProgram, "sepWeight");
+    uni_aliWeight = glGetUniformLocation(computeProgram, "aliWeight");
+    uni_cohWeight = glGetUniformLocation(computeProgram, "cohWeight");
     uni_bounds = glGetUniformLocation(computeProgram, "bounds");
 }
 
